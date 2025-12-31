@@ -40,8 +40,28 @@ function jsonOk(data: Record<string, unknown>, init?: ResponseInit) {
   return new Response(JSON.stringify({ ok: true, ...data }), { ...init, status, headers });
 }
 
+function base64EncodeBytes(bytes: Uint8Array): string {
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64DecodeToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 function base64encodeUtf8(input: string): string {
-  return btoa(unescape(encodeURIComponent(input)));
+  return base64EncodeBytes(new TextEncoder().encode(input));
+}
+
+function base64decodeUtf8(b64: string): string {
+  return new TextDecoder().decode(base64DecodeToBytes(b64));
 }
 
 function normalizeWorkerPath(pathname: string) {
@@ -78,9 +98,9 @@ function sanitizeScenePath(scenePath: string): string | null {
   const p = (scenePath || "").trim();
   if (!p) return null;
   if (p.startsWith("/") || p.includes("\\") || p.includes("..")) return null;
-  if (!p.startsWith("scenejsons/")) return null;
+  if (!(p.startsWith("scenejsons/") || p.startsWith("shows/"))) return null;
   if (!p.endsWith(".json")) return null;
-  if (p.length > 180) return null;
+  if (p.length > 220) return null;
   return p;
 }
 
@@ -356,7 +376,7 @@ export default {
     <div class="card">
       <h1>Verify you’re human</h1>
       <p>Complete the challenge, then return to the Bleepr app.</p>
-      <div class="cf-turnstile" data-sitekey="${siteKey}" data-callback="onTurnstile"></div>
+      <div class="cf-turnstile" data-sitekey="${siteKey}" data-callback="onTurnstile" data-error-callback="onTurnstileError"></div>
       <div class="status" id="status"></div>
       <p style="margin-top: 16px; font-size: 12px; color: #6b7280;">
         Session: <code>${sessionId}</code>
@@ -364,6 +384,15 @@ export default {
     </div>
     <script>
       const sessionId = ${JSON.stringify(sessionId)};
+      function onTurnstileError(code) {
+        const el = document.getElementById("status");
+        const c = String(code || "");
+        if (c === "110200") {
+          el.textContent = "Turnstile is not configured for this domain. Add " + location.hostname + " to the widget's allowed hostnames.";
+          return;
+        }
+        el.textContent = "Turnstile error: " + (c || "unknown");
+      }
       async function onTurnstile(token) {
         const el = document.getElementById("status");
         el.textContent = "Verifying…";
@@ -495,13 +524,53 @@ export default {
     }
 
     const schemaVersion = Number(sceneList.schema_version || 0);
-    if (schemaVersion !== 2) {
-      return jsonError(400, "bad_schema", "scene_list.schema_version must be 2.");
+    if (schemaVersion !== 3) {
+      return jsonError(400, "bad_schema", "scene_list.schema_version must be 3.");
     }
 
-    const imdbId = String(sceneList.imdb_id || "").trim().toLowerCase();
-    if (!/^tt\d{7,9}$/.test(imdbId)) {
-      return jsonError(400, "bad_imdb_id", "scene_list.imdb_id must look like tt1234567.");
+    const contentType = String(sceneList.content_type || "").trim().toLowerCase();
+    if (contentType !== "movie" && contentType !== "episode") {
+      return jsonError(400, "bad_content_type", "scene_list.content_type must be movie or episode.");
+    }
+
+    const ids = sceneList.ids;
+    if (!ids || typeof ids !== "object") {
+      return jsonError(400, "bad_ids", "scene_list.ids must be an object.");
+    }
+    const tmdb = (ids as any).tmdb;
+    if (!tmdb || typeof tmdb !== "object") {
+      return jsonError(400, "bad_tmdb", "scene_list.ids.tmdb must be an object.");
+    }
+    const tmdbType = String((tmdb as any).type || "").trim().toLowerCase();
+    const tmdbId = Number((tmdb as any).id || 0) || 0;
+    if (!Number.isFinite(tmdbId) || tmdbId <= 0 || (tmdbType !== "movie" && tmdbType !== "tv")) {
+      return jsonError(400, "bad_tmdb", "scene_list.ids.tmdb.type must be movie|tv and id must be a positive integer.");
+    }
+    if (contentType === "movie" && tmdbType !== "movie") {
+      return jsonError(400, "bad_tmdb", "Movie submissions must use ids.tmdb.type = movie.");
+    }
+    if (contentType === "episode" && tmdbType !== "tv") {
+      return jsonError(400, "bad_tmdb", "Episode submissions must use ids.tmdb.type = tv.");
+    }
+
+    const imdbIdRaw = String((ids as any).imdb || "").trim();
+    const imdbId = imdbIdRaw ? imdbIdRaw.toLowerCase() : "";
+    if (imdbId && !/^tt\d{7,9}$/.test(imdbId)) {
+      return jsonError(400, "bad_imdb_id", "scene_list.ids.imdb must look like tt1234567 (or be omitted).");
+    }
+
+    let seasonNumber = 0;
+    let episodeNumber = 0;
+    if (contentType === "episode") {
+      const episode = sceneList.episode;
+      if (!episode || typeof episode !== "object") {
+        return jsonError(400, "bad_episode", "scene_list.episode must be an object for episode submissions.");
+      }
+      seasonNumber = Number((episode as any).season_number || 0) || 0;
+      episodeNumber = Number((episode as any).episode_number || 0) || 0;
+      if (!Number.isFinite(seasonNumber) || !Number.isFinite(episodeNumber) || seasonNumber <= 0 || episodeNumber <= 0) {
+        return jsonError(400, "bad_episode", "scene_list.episode.season_number and episode_number must be positive integers.");
+      }
     }
 
     const scenes = sceneList.scenes;
@@ -514,7 +583,7 @@ export default {
 
     const scenePath = sanitizeScenePath(String(scenePathRaw || ""));
     if (!scenePath) {
-      return jsonError(400, "bad_scene_path", "scene_path must be under scenejsons/ and end with .json.");
+      return jsonError(400, "bad_scene_path", "scene_path must be under scenejsons/ or shows/ and end with .json.");
     }
 
     if (rawBytes > MAX_SUBMIT_BYTES) return jsonError(413, "payload_too_large", "Payload too large.");
@@ -540,7 +609,9 @@ export default {
       const baseSha = String(refInfo?.object?.sha || "");
       if (!baseSha) throw new Error("Missing base SHA.");
 
-      const branch = `bleepr/upload/${imdbId}/${Date.now()}`;
+      const branchKey = contentType === "episode" ? `tmdb_${tmdbType}_${tmdbId}_s${String(seasonNumber).padStart(2, '0')}e${String(episodeNumber).padStart(2, '0')}` : `tmdb_${tmdbType}_${tmdbId}`;
+
+      const branch = `bleepr/upload/${branchKey}/${Date.now()}`;
 
       await githubFetch(installationToken, `https://api.github.com/repos/${OWNER}/${REPO}/git/refs`, {
         method: "POST",
@@ -553,7 +624,7 @@ export default {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: `Add scene list for ${sceneList.title || imdbId} (${imdbId})`,
+          message: `Add scene list for ${sceneList.title || branchKey} (tmdb:${tmdbType}:${tmdbId}${imdbId ? ` imdb:${imdbId}` : ""})`,
           content: base64encodeUtf8(JSON.stringify(sceneList, null, 2)),
           branch,
         }),
@@ -566,7 +637,7 @@ export default {
       );
       const indexSha = String(indexResp?.sha || "");
       const indexContentB64 = String(indexResp?.content || "");
-      const indexText = indexContentB64 ? decodeURIComponent(escape(atob(indexContentB64.replace(/\n/g, "")))) : "{}";
+      const indexText = indexContentB64 ? base64decodeUtf8(indexContentB64.replace(/\n/g, "")) : "{}";
 
       let indexJson: any = {};
       try {
@@ -576,21 +647,49 @@ export default {
       }
       if (!indexJson || typeof indexJson !== "object") indexJson = {};
       if (!Array.isArray(indexJson.movies)) indexJson.movies = [];
+      if (!Array.isArray(indexJson.episodes)) indexJson.episodes = [];
+      if (!indexJson.schema_version) indexJson.schema_version = 2;
 
-      indexJson.movies.push({
-        imdb_id: imdbId,
-        title: String(sceneList.title || "").trim(),
-        path: scenePath,
-        created_at: String(sceneList.created_at || "").trim(),
-        video_duration_ms: Number(sceneList.video_duration_ms || 0) || 0,
-        label: String(sceneList.label || "").trim(),
-      });
+      const title = String(sceneList.title || "").trim();
+      const createdAt = String(sceneList.created_at || "").trim();
+      const durationMs = Number(sceneList.video_duration_ms || 0) || 0;
+      const label = String(sceneList.label || "").trim();
+
+      if (contentType === "movie") {
+        indexJson.movies.push({
+          imdb_id: imdbId || `tmdb_movie_${tmdbId}`,
+          tmdb: { type: tmdbType, id: tmdbId },
+          title,
+          year: Number(sceneList.year || 0) || 0,
+          path: scenePath,
+          created_at: createdAt,
+          video_duration_ms: durationMs,
+          label,
+        });
+      } else {
+        const seriesTitle = String(sceneList.series?.title || "").trim();
+        const episodeTitle = String(sceneList.episode?.title || "").trim();
+        indexJson.episodes.push({
+          tmdb: { type: tmdbType, id: tmdbId },
+          imdb_id: imdbId || "",
+          series_title: seriesTitle,
+          season_number: seasonNumber,
+          episode_number: episodeNumber,
+          episode_title: episodeTitle,
+          title,
+          year: Number(sceneList.year || 0) || 0,
+          path: scenePath,
+          created_at: createdAt,
+          video_duration_ms: durationMs,
+          label,
+        });
+      }
 
       await githubFetch(installationToken, `https://api.github.com/repos/${OWNER}/${REPO}/contents/index.json`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: `Update index for ${sceneList.title || imdbId} (${imdbId})`,
+          message: `Update index for ${sceneList.title || branchKey} (tmdb:${tmdbType}:${tmdbId})`,
           content: base64encodeUtf8(JSON.stringify(indexJson, null, 2)),
           sha: indexSha,
           branch,
@@ -601,10 +700,10 @@ export default {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          title: `Add scene list: ${sceneList.title || imdbId} (${imdbId})`,
+          title: `Add scene list: ${sceneList.title || branchKey} (tmdb:${tmdbType}:${tmdbId})`,
           head: `${OWNER}:${branch}`,
           base: baseBranch,
-          body: `IMDb: ${imdbId}\nPath: ${scenePath}\nCreated: ${sceneList.created_at || ""}\n`,
+          body: `TMDb: ${tmdbType}:${tmdbId}\nIMDb: ${imdbId || "(none)"}\nType: ${contentType}${contentType === "episode" ? `\nSeason: ${seasonNumber}\nEpisode: ${episodeNumber}` : ""}\nPath: ${scenePath}\nCreated: ${sceneList.created_at || ""}\n`,
         }),
       });
 
