@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "imdb_id": "tt1234567",
+  "title": "Men in Black (1997)",
+  "video_duration_ms": 20311,
+  "created_at": "2025-12-31T22:51:44Z",
+  "label": "test",
+  "source_app": {
+    "name": "Bleepr"
+  },
+  "scenes": [
+    {
+      "start_ms": 2000,
+      "end_ms": 10000,
+      "action": "Remove",
+      "category": "graphic",
+      "note": "",
+      "enabled": true
+    },
+    {
+      "start_ms": 2000,
+      "end_ms": 15000,
+      "action": "Blur",
+      "category": "objectionable",
+      "note": "",
+      "enabled": true
+    }
+  ]
+}
