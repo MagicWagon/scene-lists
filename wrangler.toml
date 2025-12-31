@@ -1,3 +1,11 @@
 name = "bleepr-scene-uploader"
 main = "src/index.ts"
 compatibility_date = "2025-12-30"
+
+[[durable_objects.bindings]]
+name = "CHALLENGES"
+class_name = "Challenges"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["Challenges"]

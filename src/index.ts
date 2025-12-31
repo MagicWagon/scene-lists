@@ -4,17 +4,40 @@ type Env = {
   GITHUB_APP_ID: string;
   GITHUB_INSTALLATION_ID: string;
   GITHUB_PRIVATE_KEY_PEM: string;
-  BLEEPR_SUBMIT_KEY?: string;
+  TURNSTILE_SITE_KEY: string;
+  TURNSTILE_SECRET_KEY: string;
+  CHALLENGES: any;
 };
 
 const OWNER = "MagicWagon";
 const REPO = "scene-lists";
+const CHALLENGE_TTL_SECONDS = 10 * 60;
+const RATE_LIMIT_WINDOW_SECONDS = 60 * 60;
+const RATE_LIMIT_CHALLENGE_STARTS_PER_WINDOW = 10;
+const RATE_LIMIT_SUBMITS_PER_WINDOW = 3;
+const MAX_SUBMIT_BYTES = 900_000;
+const MAX_SUBMIT_SCENES = 2500;
+
+type StoredChallengeSession = {
+  ip_hash: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+  verified: boolean;
+  verified_at_ms?: number;
+};
 
 function jsonError(status: number, code: string, message: string, details?: unknown) {
   return Response.json(
     { ok: false, error: { code, message, details: details ?? null } },
     { status, headers: { "Content-Type": "application/json" } },
   );
+}
+
+function jsonOk(data: Record<string, unknown>, init?: ResponseInit) {
+  const status = init?.status ?? 200;
+  const headers = new Headers(init?.headers);
+  headers.set("Content-Type", "application/json");
+  return new Response(JSON.stringify({ ok: true, ...data }), { ...init, status, headers });
 }
 
 function base64encodeUtf8(input: string): string {
@@ -25,6 +48,32 @@ function normalizeWorkerPath(pathname: string) {
   return pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
 }
 
+function getRequestIp(request: Request): string {
+  const cfIp = request.headers.get("CF-Connecting-IP");
+  if (cfIp) return cfIp.trim();
+  const xff = request.headers.get("X-Forwarded-For");
+  if (xff) return xff.split(",")[0]?.trim() || "unknown";
+  return "unknown";
+}
+
+function base64UrlEncode(bytes: ArrayBuffer): string {
+  const bin = String.fromCharCode(...new Uint8Array(bytes));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function sha256Base64Url(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return base64UrlEncode(digest);
+}
+
+async function readJsonWithLimit(request: Request, maxBytes: number): Promise<any> {
+  const buf = await request.arrayBuffer();
+  if (buf.byteLength > maxBytes) throw new Error("payload_too_large");
+  const text = new TextDecoder().decode(buf);
+  return text ? JSON.parse(text) : null;
+}
+
 function sanitizeScenePath(scenePath: string): string | null {
   const p = (scenePath || "").trim();
   if (!p) return null;
@@ -33,6 +82,168 @@ function sanitizeScenePath(scenePath: string): string | null {
   if (!p.endsWith(".json")) return null;
   if (p.length > 180) return null;
   return p;
+}
+
+export class Challenges {
+  constructor(
+    private readonly state: any,
+    private readonly env: Env,
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = normalizeWorkerPath(url.pathname);
+
+    if (request.method === "POST" && path === "/rate/consume") {
+      let body: any;
+      try {
+        body = await readJsonWithLimit(request, 10_000);
+      } catch (e: any) {
+        if (String(e?.message || e) === "payload_too_large") return jsonError(413, "payload_too_large", "Payload too large.");
+        return jsonError(400, "bad_json", "Body must be valid JSON.");
+      }
+
+      const kind = String(body?.kind || "");
+      const limit = Number(body?.limit || 0) || 0;
+      const windowSeconds = Number(body?.window_seconds || 0) || 0;
+      if (!kind || !Number.isFinite(limit) || limit <= 0 || !Number.isFinite(windowSeconds) || windowSeconds <= 0) {
+        return jsonError(400, "bad_request", "Missing or invalid rate limit parameters.");
+      }
+
+      const nowMs = Date.now();
+      const windowMs = windowSeconds * 1000;
+      const bucket = Math.floor(nowMs / windowMs);
+      const key = `${kind}:${bucket}`;
+      const current = Number((await this.state.storage.get<number>(key)) || 0) || 0;
+      const next = current + 1;
+      await this.state.storage.put(key, next, { expirationTtl: windowSeconds * 2 });
+
+      if (next > limit) {
+        const bucketEndMs = (bucket + 1) * windowMs;
+        const retryAfterSeconds = Math.max(1, Math.ceil((bucketEndMs - nowMs) / 1000));
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error: { code: "rate_limited", message: "Too many requests.", details: { retry_after_seconds: retryAfterSeconds } },
+          }),
+          { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(retryAfterSeconds) } },
+        );
+      }
+
+      return jsonOk({});
+    }
+
+    if (request.method === "POST" && path === "/session/init") {
+      let body: any;
+      try {
+        body = await readJsonWithLimit(request, 10_000);
+      } catch (e: any) {
+        if (String(e?.message || e) === "payload_too_large") return jsonError(413, "payload_too_large", "Payload too large.");
+        return jsonError(400, "bad_json", "Body must be valid JSON.");
+      }
+
+      const ipHash = String(body?.ip_hash || "").trim();
+      const ttlSeconds = Number(body?.ttl_seconds || 0) || 0;
+      if (!ipHash || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+        return jsonError(400, "bad_request", "Missing or invalid session parameters.");
+      }
+
+      const nowMs = Date.now();
+      const session: StoredChallengeSession = {
+        ip_hash: ipHash,
+        created_at_ms: nowMs,
+        expires_at_ms: nowMs + ttlSeconds * 1000,
+        verified: false,
+      };
+
+      await this.state.storage.put("session", session, { expirationTtl: ttlSeconds });
+      return jsonOk({});
+    }
+
+    if (request.method === "GET" && path === "/session/get") {
+      const session = (await this.state.storage.get<StoredChallengeSession>("session")) || null;
+      if (!session) return jsonOk({ session: null });
+      if (Date.now() > session.expires_at_ms) {
+        await this.state.storage.delete("session");
+        return jsonOk({ session: null });
+      }
+      return jsonOk({ session });
+    }
+
+    if (request.method === "POST" && path === "/session/verify") {
+      const session = (await this.state.storage.get<StoredChallengeSession>("session")) || null;
+      if (!session) return jsonError(404, "not_found", "Session not found.");
+      if (Date.now() > session.expires_at_ms) {
+        await this.state.storage.delete("session");
+        return jsonError(404, "not_found", "Session not found.");
+      }
+
+      session.verified = true;
+      session.verified_at_ms = Date.now();
+      const remainingSeconds = Math.max(1, Math.ceil((session.expires_at_ms - Date.now()) / 1000));
+      await this.state.storage.put("session", session, { expirationTtl: remainingSeconds });
+      return jsonOk({});
+    }
+
+    return new Response("not found", { status: 404 });
+  }
+}
+
+async function consumeRateLimit(env: Env, ipHash: string, kind: "start" | "submit"): Promise<Response | null> {
+  const id = env.CHALLENGES.idFromName(`ip:${ipHash}`);
+  const stub = env.CHALLENGES.get(id);
+  const resp = await stub.fetch("https://do/rate/consume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      kind,
+      limit: kind === "start" ? RATE_LIMIT_CHALLENGE_STARTS_PER_WINDOW : RATE_LIMIT_SUBMITS_PER_WINDOW,
+      window_seconds: RATE_LIMIT_WINDOW_SECONDS,
+    }),
+  });
+  return resp.ok ? null : resp;
+}
+
+async function initChallengeSession(env: Env, sessionId: string, ipHash: string): Promise<void> {
+  const id = env.CHALLENGES.idFromName(`sess:${sessionId}`);
+  const stub = env.CHALLENGES.get(id);
+  const resp = await stub.fetch("https://do/session/init", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ip_hash: ipHash, ttl_seconds: CHALLENGE_TTL_SECONDS }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to init session (${resp.status}): ${text}`);
+  }
+}
+
+async function getChallengeSession(env: Env, sessionId: string): Promise<StoredChallengeSession | null> {
+  const id = env.CHALLENGES.idFromName(`sess:${sessionId}`);
+  const stub = env.CHALLENGES.get(id);
+  const resp = await stub.fetch("https://do/session/get");
+  if (!resp.ok) return null;
+  const data: any = await resp.json().catch(() => null);
+  const session = data?.session || null;
+  if (!session) return null;
+  return session as StoredChallengeSession;
+}
+
+async function markChallengeVerified(env: Env, sessionId: string): Promise<void> {
+  const id = env.CHALLENGES.idFromName(`sess:${sessionId}`);
+  const stub = env.CHALLENGES.get(id);
+  const resp = await stub.fetch("https://do/session/verify", { method: "POST" });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to verify session (${resp.status}): ${text}`);
+  }
+}
+
+function captchaRequiredResponse(): Response {
+  return new Response(
+    JSON.stringify({ ok: false, error: { code: "captcha_required", message: "Please complete verification." } }),
+    { status: 403, headers: { "Content-Type": "application/json" } },
+  );
 }
 
 async function githubFetch(token: string, url: string, init?: RequestInit) {
@@ -104,22 +315,174 @@ export default {
     const url = new URL(request.url);
     const path = normalizeWorkerPath(url.pathname);
 
+    if (request.method === "POST" && path === "/challenge/start") {
+      const ipHash = await sha256Base64Url(getRequestIp(request));
+      const limited = await consumeRateLimit(env, ipHash, "start");
+      if (limited) return limited;
+
+      const sessionId = crypto.randomUUID();
+      try {
+        await initChallengeSession(env, sessionId, ipHash);
+      } catch (e: any) {
+        return jsonError(500, "session_error", "Failed to create challenge session.", String(e?.message || e));
+      }
+
+      return jsonOk({ session_id: sessionId, verify_url: `${url.origin}/challenge/${sessionId}` });
+    }
+
+    const challengeMatch = path.match(/^\/challenge\/([a-zA-Z0-9-]+)$/);
+    if (request.method === "GET" && challengeMatch) {
+      const sessionId = challengeMatch[1]!;
+      const siteKey = String(env.TURNSTILE_SITE_KEY || "").trim();
+      if (!siteKey) return jsonError(500, "config_error", "Missing TURNSTILE_SITE_KEY.");
+
+      const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bleepr Verification</title>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 32px; line-height: 1.4; }
+      .card { max-width: 520px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 14px; }
+      h1 { font-size: 18px; margin: 0 0 12px; }
+      p { margin: 0 0 16px; color: #374151; }
+      .status { margin-top: 14px; font-size: 14px; color: #111827; }
+      code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Verify you’re human</h1>
+      <p>Complete the challenge, then return to the Bleepr app.</p>
+      <div class="cf-turnstile" data-sitekey="${siteKey}" data-callback="onTurnstile"></div>
+      <div class="status" id="status"></div>
+      <p style="margin-top: 16px; font-size: 12px; color: #6b7280;">
+        Session: <code>${sessionId}</code>
+      </p>
+    </div>
+    <script>
+      const sessionId = ${JSON.stringify(sessionId)};
+      async function onTurnstile(token) {
+        const el = document.getElementById("status");
+        el.textContent = "Verifying…";
+        try {
+          const resp = await fetch("/challenge/complete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, token })
+          });
+          const data = await resp.json().catch(() => null);
+          if (resp.ok && data && data.ok) {
+            el.textContent = "Verified. You can close this tab.";
+          } else {
+            el.textContent = (data && data.error && data.error.message) ? data.error.message : "Verification failed.";
+          }
+        } catch (e) {
+          el.textContent = "Verification failed.";
+        }
+      }
+    </script>
+  </body>
+</html>`;
+      return new Response(html, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    if (request.method === "POST" && path === "/challenge/complete") {
+      let body: any;
+      try {
+        body = await readJsonWithLimit(request, 30_000);
+      } catch (e: any) {
+        if (String(e?.message || e) === "payload_too_large") return jsonError(413, "payload_too_large", "Payload too large.");
+        return jsonError(400, "bad_json", "Body must be valid JSON.");
+      }
+
+      const sessionId = String(body?.session_id || "").trim();
+      const token = String(body?.token || "").trim();
+      if (!sessionId || !token) return jsonError(400, "bad_request", "Missing session_id or token.");
+
+      const ipHash = await sha256Base64Url(getRequestIp(request));
+      const session = await getChallengeSession(env, sessionId);
+      if (!session || session.ip_hash !== ipHash) return captchaRequiredResponse();
+
+      const secret = String(env.TURNSTILE_SECRET_KEY || "").trim();
+      if (!secret) return jsonError(500, "config_error", "Missing TURNSTILE_SECRET_KEY.");
+
+      const form = new URLSearchParams();
+      form.set("secret", secret);
+      form.set("response", token);
+      const ip = getRequestIp(request);
+      if (ip && ip !== "unknown") form.set("remoteip", ip);
+
+      let verifyResp: Response;
+      try {
+        verifyResp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: form.toString(),
+        });
+      } catch (e: any) {
+        return jsonError(502, "turnstile_unreachable", "Failed to reach Turnstile verification.", String(e?.message || e));
+      }
+
+      const verifyData: any = await verifyResp.json().catch(() => null);
+      if (!verifyResp.ok) {
+        return jsonError(502, "turnstile_error", "Turnstile verification failed.", verifyData);
+      }
+      if (!verifyData?.success) {
+        return jsonError(403, "turnstile_invalid", "Invalid verification token.", verifyData);
+      }
+
+      try {
+        await markChallengeVerified(env, sessionId);
+      } catch (e: any) {
+        return jsonError(500, "session_error", "Failed to mark session verified.", String(e?.message || e));
+      }
+
+      return jsonOk({ verified: true });
+    }
+
+    if (request.method === "POST" && path === "/challenge/status") {
+      let body: any;
+      try {
+        body = await readJsonWithLimit(request, 10_000);
+      } catch (e: any) {
+        if (String(e?.message || e) === "payload_too_large") return jsonError(413, "payload_too_large", "Payload too large.");
+        return jsonError(400, "bad_json", "Body must be valid JSON.");
+      }
+
+      const sessionId = String(body?.session_id || "").trim();
+      if (!sessionId) return jsonError(400, "bad_request", "Missing session_id.");
+
+      const ipHash = await sha256Base64Url(getRequestIp(request));
+      const session = await getChallengeSession(env, sessionId);
+      const verified = Boolean(session && session.ip_hash === ipHash && session.verified);
+      return jsonOk({ verified });
+    }
+
     if (request.method !== "POST" || path !== "/submit-scene") {
       return new Response("not found", { status: 404 });
     }
 
-    // Optional shared-secret protection (recommended).
-    const submitKey = String(env.BLEEPR_SUBMIT_KEY || "").trim();
-    if (submitKey) {
-      const auth = request.headers.get("authorization") || "";
-      if (auth !== `Bearer ${submitKey}`) {
-        return jsonError(401, "unauthorized", "Missing or invalid Authorization bearer token.");
-      }
-    }
+    const sessionId = String(request.headers.get("X-Bleepr-Challenge") || "").trim();
+    if (!sessionId) return captchaRequiredResponse();
+
+    const ipHash = await sha256Base64Url(getRequestIp(request));
+    const session = await getChallengeSession(env, sessionId);
+    if (!session || session.ip_hash !== ipHash || !session.verified) return captchaRequiredResponse();
+
+    const limited = await consumeRateLimit(env, ipHash, "submit");
+    if (limited) return limited;
 
     let body: any;
+    let rawBytes = 0;
     try {
-      body = await request.json();
+      const buf = await request.arrayBuffer();
+      rawBytes = buf.byteLength;
+      if (rawBytes > MAX_SUBMIT_BYTES) return jsonError(413, "payload_too_large", "Payload too large.");
+      const text = new TextDecoder().decode(buf);
+      body = text ? JSON.parse(text) : null;
     } catch {
       return jsonError(400, "bad_json", "Body must be valid JSON.");
     }
@@ -145,7 +508,7 @@ export default {
     if (!Array.isArray(scenes) || scenes.length === 0) {
       return jsonError(400, "no_scenes", "scene_list.scenes must be a non-empty array.");
     }
-    if (scenes.length > 2500) {
+    if (scenes.length > MAX_SUBMIT_SCENES) {
       return jsonError(400, "too_many_scenes", "scene_list.scenes is too large.");
     }
 
@@ -154,11 +517,7 @@ export default {
       return jsonError(400, "bad_scene_path", "scene_path must be under scenejsons/ and end with .json.");
     }
 
-    // Size guardrail
-    const raw = new TextEncoder().encode(JSON.stringify(body));
-    if (raw.byteLength > 900_000) {
-      return jsonError(413, "payload_too_large", "Payload too large.");
-    }
+    if (rawBytes > MAX_SUBMIT_BYTES) return jsonError(413, "payload_too_large", "Payload too large.");
 
     let installationToken: string;
     try {
@@ -252,7 +611,7 @@ export default {
       const prUrl = String(pr?.html_url || "").trim();
       if (!prUrl) throw new Error("PR created but missing html_url.");
 
-      return Response.json({ ok: true, pr_url: prUrl });
+      return jsonOk({ pr_url: prUrl });
     } catch (e: any) {
       return jsonError(500, "github_error", "Failed to create pull request.", String(e?.message || e));
     }
