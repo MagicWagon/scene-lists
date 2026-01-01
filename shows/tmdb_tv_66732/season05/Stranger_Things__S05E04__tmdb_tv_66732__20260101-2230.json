@@ -1,0 +1,68 @@
+{
+  "schema_version": 3,
+  "content_type": "episode",
+  "ids": {
+    "tmdb": {
+      "type": "tv",
+      "id": 66732
+    },
+    "imdb": "tt4574334"
+  },
+  "series": {
+    "title": "Stranger Things",
+    "ids": {
+      "tmdb": {
+        "type": "tv",
+        "id": 66732
+      },
+      "imdb": "tt4574334"
+    }
+  },
+  "episode": {
+    "season_number": 5,
+    "episode_number": 4,
+    "title": "Chapter Four: Sorcerer"
+  },
+  "title": "Stranger Things — S05E04 — Chapter Four: Sorcerer",
+  "year": 2016,
+  "video_duration_ms": 5205664,
+  "created_at": "2026-01-01T22:30:11Z",
+  "label": "Test 2",
+  "source_app": {
+    "name": "Bleepr"
+  },
+  "scenes": [
+    {
+      "start_ms": 4755,
+      "end_ms": 5506,
+      "action": "Blur",
+      "category": "blasphemy",
+      "note": "",
+      "enabled": true
+    },
+    {
+      "start_ms": 6720,
+      "end_ms": 7174,
+      "action": "Remove",
+      "category": "blasphemy",
+      "note": "",
+      "enabled": true
+    },
+    {
+      "start_ms": 30155,
+      "end_ms": 30592,
+      "action": "Mute",
+      "category": "drugs_implied",
+      "note": "",
+      "enabled": true
+    },
+    {
+      "start_ms": 31782,
+      "end_ms": 32288,
+      "action": "Blur",
+      "category": "life_events",
+      "note": "",
+      "enabled": true
+    }
+  ]
+}
