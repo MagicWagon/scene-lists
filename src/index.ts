@@ -10,7 +10,7 @@ type Env = {
 };
 
 const OWNER = "MagicWagon";
-const REPO = "scene-lists";
+const REPO = "bleepr-scene-uploader";
 const CHALLENGE_TTL_SECONDS = 10 * 60;
 const RATE_LIMIT_WINDOW_SECONDS = 60 * 60;
 const RATE_LIMIT_CHALLENGE_STARTS_PER_WINDOW = 10;
@@ -98,7 +98,7 @@ function sanitizeScenePath(scenePath: string): string | null {
   const p = (scenePath || "").trim();
   if (!p) return null;
   if (p.startsWith("/") || p.includes("\\") || p.includes("..")) return null;
-  if (!(p.startsWith("scenejsons/") || p.startsWith("shows/"))) return null;
+  if (!(p.startsWith("movies/") || p.startsWith("shows/") || p.startsWith("scenejsons/"))) return null;
   if (!p.endsWith(".json")) return null;
   if (p.length > 220) return null;
   return p;
@@ -583,7 +583,7 @@ export default {
 
     const scenePath = sanitizeScenePath(String(scenePathRaw || ""));
     if (!scenePath) {
-      return jsonError(400, "bad_scene_path", "scene_path must be under scenejsons/ or shows/ and end with .json.");
+      return jsonError(400, "bad_scene_path", "scene_path must be under movies/ or shows/ and end with .json.");
     }
 
     if (rawBytes > MAX_SUBMIT_BYTES) return jsonError(413, "payload_too_large", "Payload too large.");
