@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "imdb_id": "tt0071853",
+  "title": "Monty Python and the Holy Grail (1975)",
+  "video_duration_ms": 5527522,
+  "created_at": "2025-12-21T05:34:53Z",
+  "label": "Removes sex scenes and excessive gore.",
+  "source_app": {
+    "name": "CensorTool"
+  },
+  "scenes": [
+    {
+      "start_ms": 797805,
+      "end_ms": 799850,
+      "action": "Blackout",
+      "category": "",
+      "note": "Black Knight stab through helmet.",
+      "enabled": true
+    },
+    {
+      "start_ms": 2154000,
+      "end_ms": 2591962,
+      "action": "Remove",
+      "category": "",
+      "note": "The Castle Anthrax",
+      "enabled": true
+    },
+    {
+      "start_ms": 3307371,
+      "end_ms": 3311316,
+      "action": "Remove",
+      "category": "",
+      "note": "Lancelot storms castle",
+      "enabled": true
+    },
+    {
+      "start_ms": 3323737,
+      "end_ms": 3326031,
+      "action": "Remove",
+      "category": "",
+      "note": "Lancelot storms castle",
+      "enabled": true
+    },
+    {
+      "start_ms": 4274160,
+      "end_ms": 4276633,
+      "action": "Blackout",
+      "category": "",
+      "note": "Rabbit attacks man in neck",
+      "enabled": true
+    }
+  ]
+}
